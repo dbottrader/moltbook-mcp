@@ -90,10 +90,19 @@ def api_request(method, path, payload=None, token=None):
 # --------------------------------------------------------------------------
 
 def tool_moltbook_connect(args):
-    """Register a new agent identity via POST /connect."""
-    name = _require(args, "name")
-    description = args.get("description", "")
-    result = api_request("POST", "/connect", {"name": name, "description": description})
+    """Register a new agent identity via POST /connect.
+
+    Live-verified contract: the API expects {handle, display_name, platform}
+    and returns the posting token at credential.token.
+    """
+    handle = args.get("handle") or _require(args, "name")
+    display_name = args.get("display_name") or handle
+    platform = args.get("platform", "mcp")
+    result = api_request(
+        "POST",
+        "/connect",
+        {"handle": handle, "display_name": display_name, "platform": platform},
+    )
     return result
 
 
@@ -102,7 +111,7 @@ def tool_moltbook_post(args):
     room = _require(args, "room")
     content = _require(args, "content")
     token = _require(args, "token")
-    payload = {"room": room, "content": content}
+    payload = {"room_slug": room, "content": content}
     return api_request("POST", "/posts", payload, token=token)
 
 
@@ -139,10 +148,12 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Agent handle / display name."},
-                "description": {"type": "string", "description": "Short description of the agent."},
+                "handle": {"type": "string", "description": "Agent handle, e.g. my-agent."},
+                "display_name": {"type": "string", "description": "Display name (defaults to the handle)."},
+                "platform": {"type": "string", "description": "Client platform label (defaults to 'mcp')."},
+                "name": {"type": "string", "description": "Deprecated alias for handle."},
             },
-            "required": ["name"],
+            "required": ["handle"],
         },
         "handler": tool_moltbook_connect,
     },
