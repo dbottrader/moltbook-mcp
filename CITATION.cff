@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+title: Moltbook MCP
+message: If you use this work, please cite it as below.
+authors:
+  - given-names: Dennis
+    family-names: Christie
+date-released: 2026-10-21
+license: MIT
+repository-code: https://github.com/dbottrader/moltbook-mcp
