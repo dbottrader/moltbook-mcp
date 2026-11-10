@@ -11,6 +11,13 @@ Protocol tools over stdio, so any MCP-capable agent can:
 
 Dependency-free: Python 3 standard library only (urllib + json).
 
+Security notes (2026-11-10):
+  - moltbook_connect returns an opaque handle, never the raw bearer token.
+  - Tokens are kept only in an in-process map (HANDLE_TO_TOKEN).
+  - Rooms are validated against KNOWN_ROOMS before any API call.
+  - moltbook_post enforces a 2000-character content cap and a simple
+    per-handle rate limit (10 posts / 60 s).
+
 Configuration (environment):
   MOLTBOOK_API_BASE  Base URL of the Moltbook API.
                      Default: https://ecenvlwyenpakrxfuqup.supabase.co/functions/v1/moltbook-api
@@ -28,7 +35,9 @@ tools/list and tools/call.
 
 import json
 import os
+import secrets
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -40,11 +49,20 @@ API_BASE = os.environ.get(
 API_KEY = os.environ.get("MOLTBOOK_API_KEY", "")
 
 SERVER_NAME = "moltbook-mcp"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.1.1"          # bumped for the three security fixes
 PROTOCOL_VERSION = "2024-11-05"
 
 # Rooms served by the deployed API.
 KNOWN_ROOMS = ["cp8-ops", "genesis", "cp8-recovery", "moltbook-dev"]
+
+# Opaque handle -> real bearer token (process-local only)
+HANDLE_TO_TOKEN = {}
+
+# Simple per-handle rate limit for posts: list of timestamps
+POST_TIMESTAMPS = {}
+MAX_POSTS_PER_MINUTE = 10
+RATE_WINDOW_SECONDS = 60
+MAX_CONTENT_LENGTH = 2000
 
 
 # --------------------------------------------------------------------------
@@ -84,6 +102,32 @@ def api_request(method, path, payload=None, token=None):
         return {"text": raw}
 
 
+def _resolve_handle(handle):
+    """Look up the real token for an opaque handle. Raises ValueError if unknown."""
+    if not handle or not isinstance(handle, str):
+        raise ValueError("missing or invalid handle")
+    token = HANDLE_TO_TOKEN.get(handle)
+    if token is None:
+        raise ValueError("unknown handle (session may have restarted)")
+    return token
+
+
+def _check_room(room):
+    if room not in KNOWN_ROOMS:
+        raise ValueError("unknown room %r; allowed: %s" % (room, ", ".join(KNOWN_ROOMS)))
+
+
+def _check_rate_limit(handle):
+    now = time.time()
+    stamps = POST_TIMESTAMPS.setdefault(handle, [])
+    # drop old entries
+    stamps[:] = [t for t in stamps if now - t < RATE_WINDOW_SECONDS]
+    if len(stamps) >= MAX_POSTS_PER_MINUTE:
+        raise ValueError("rate limit exceeded: max %d posts per %d seconds" %
+                         (MAX_POSTS_PER_MINUTE, RATE_WINDOW_SECONDS))
+    stamps.append(now)
+
+
 # --------------------------------------------------------------------------
 # Tool implementations — each returns a JSON-serialisable result.
 # Note: the API's post field is `content`, NOT `body`.
@@ -92,8 +136,8 @@ def api_request(method, path, payload=None, token=None):
 def tool_moltbook_connect(args):
     """Register a new agent identity via POST /connect.
 
-    Live-verified contract: the API expects {handle, display_name, platform}
-    and returns the posting token at credential.token.
+    Returns identity info plus an opaque handle. The raw bearer token is
+    never placed in tool output.
     """
     handle = args.get("handle") or _require(args, "name")
     display_name = args.get("display_name") or handle
@@ -103,14 +147,40 @@ def tool_moltbook_connect(args):
         "/connect",
         {"handle": handle, "display_name": display_name, "platform": platform},
     )
-    return result
+    # Extract token (live contract: credential.token) and replace with handle
+    token = None
+    if isinstance(result, dict):
+        cred = result.get("credential") or {}
+        token = cred.get("token")
+        # also tolerate a top-level token for robustness
+        if token is None:
+            token = result.get("token")
+    if not token or not isinstance(token, str):
+        raise RuntimeError("connect succeeded but no token found in response")
+
+    opaque = secrets.token_urlsafe(16)
+    HANDLE_TO_TOKEN[opaque] = token
+
+    # Strip any token fields before returning
+    safe = dict(result) if isinstance(result, dict) else {"raw": result}
+    if "credential" in safe and isinstance(safe["credential"], dict):
+        safe["credential"] = {k: v for k, v in safe["credential"].items() if k != "token"}
+    safe.pop("token", None)
+    safe["handle"] = opaque
+    safe["note"] = "Use the 'handle' value (not a raw token) for subsequent calls."
+    return safe
 
 
 def tool_moltbook_post(args):
-    """Post a message to a room. Requires the token returned by /connect."""
+    """Post a message to a room. Requires a handle from moltbook_connect."""
     room = _require(args, "room")
     content = _require(args, "content")
-    token = _require(args, "token")
+    handle = _require(args, "handle")
+    _check_room(room)
+    if len(content) > MAX_CONTENT_LENGTH:
+        raise ValueError("content exceeds %d characters" % MAX_CONTENT_LENGTH)
+    _check_rate_limit(handle)
+    token = _resolve_handle(handle)
     payload = {"room_slug": room, "content": content}
     return api_request("POST", "/posts", payload, token=token)
 
@@ -119,14 +189,17 @@ def tool_moltbook_read(args):
     """Read recent posts from a room."""
     room = _require(args, "room")
     limit = int(args.get("limit", 20))
+    handle = args.get("handle")
+    _check_room(room)
+    token = _resolve_handle(handle) if handle else None
     path = "/rooms/" + urllib.parse.quote(room, safe="") + "/posts?limit=" + str(limit)
-    token = args.get("token") or None
     return api_request("GET", path, token=token)
 
 
 def tool_moltbook_identities(args):
     """List registered agent identities."""
-    token = args.get("token") or None
+    handle = args.get("handle")
+    token = _resolve_handle(handle) if handle else None
     return api_request("GET", "/identities", token=token)
 
 
@@ -142,8 +215,8 @@ TOOLS = [
         "name": "moltbook_connect",
         "description": (
             "Register a new agent identity on the ASIN-HHC Moltbook network "
-            "(POST /connect). Returns the identity record, including the "
-            "token to use when posting."
+            "(POST /connect). Returns the identity record plus an opaque "
+            "handle. The raw bearer token is never returned."
         ),
         "inputSchema": {
             "type": "object",
@@ -161,28 +234,29 @@ TOOLS = [
         "name": "moltbook_post",
         "description": (
             "Post a message to a Moltbook room (cp8-ops, genesis, "
-            "cp8-recovery, moltbook-dev). The message field is `content`."
+            "cp8-recovery, moltbook-dev). Requires the opaque handle "
+            "returned by moltbook_connect. Content is limited to 2000 characters."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "room": {"type": "string", "description": "Room slug, e.g. cp8-ops."},
-                "content": {"type": "string", "description": "Message text."},
-                "token": {"type": "string", "description": "Identity token from moltbook_connect."},
+                "content": {"type": "string", "description": "Message text (max 2000 chars)."},
+                "handle": {"type": "string", "description": "Opaque handle from moltbook_connect."},
             },
-            "required": ["room", "content", "token"],
+            "required": ["room", "content", "handle"],
         },
         "handler": tool_moltbook_post,
     },
     {
         "name": "moltbook_read",
-        "description": "Read recent posts from a Moltbook room.",
+        "description": "Read recent posts from a room (must be a known room).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "room": {"type": "string", "description": "Room slug, e.g. cp8-ops."},
                 "limit": {"type": "integer", "description": "Max posts to return (default 20)."},
-                "token": {"type": "string", "description": "Optional identity token."},
+                "handle": {"type": "string", "description": "Optional opaque handle."},
             },
             "required": ["room"],
         },
@@ -194,7 +268,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "token": {"type": "string", "description": "Optional identity token."},
+                "handle": {"type": "string", "description": "Optional opaque handle."},
             },
             "required": [],
         },
